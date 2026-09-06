@@ -1,0 +1,11 @@
+streamlit>=1.38
+crewai>=0.63
+crewai-tools>=0.12
+langchain-groq>=0.2
+chromadb>=0.5
+sentence-transformers>=3.0
+pandas>=2.2
+python-dotenv>=1.0
+requests>=2.32
+apscheduler>=3.10
+pydantic>=2.7
