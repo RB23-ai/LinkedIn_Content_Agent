@@ -93,6 +93,11 @@ class LinkedInAPI:
         member_id = profile["sub"]
         return f"urn:li:person:{member_id}"
 
+    def get_person_display_name(self) -> str:
+        profile = self.get_profile()
+        name = f"{profile.get('given_name', '')} {profile.get('family_name', '')}".strip()
+        return name or profile.get("email", "LinkedIn member")
+
     # ---------------------------------------------------------------
     # 2. Publish a text post as the authenticated member.
     #    Uses the current Posts API (/rest/posts), which superseded
@@ -167,6 +172,29 @@ class LinkedInAPI:
             timeout=15,
         )
         return resp.status_code in (200, 204)
+
+
+def build_organization_urn(org_id_or_urn: str) -> str:
+    """
+    Normalizes either a raw numeric LinkedIn Company Page ID (found in the
+    page's admin URL, e.g. linkedin.com/company/12345678/admin) or an
+    already-formatted URN into 'urn:li:organization:<id>'.
+
+    NOTE: There's no API call to "list organizations I administer" available
+    on a standard app tier -- the user has to find their own page's numeric
+    ID from the page's admin view URL and paste it in. Publishing to it also
+    requires the app to have been granted admin access to that specific page
+    via LinkedIn's page verification flow, not just a generic OAuth scope.
+    """
+    org_id_or_urn = org_id_or_urn.strip()
+    if org_id_or_urn.startswith("urn:li:organization:"):
+        return org_id_or_urn
+    if org_id_or_urn.isdigit():
+        return f"urn:li:organization:{org_id_or_urn}"
+    raise ValueError(
+        "Expected a numeric LinkedIn Company Page ID or a full "
+        "'urn:li:organization:...' URN."
+    )
 
 
 # ---------------------------------------------------------------------

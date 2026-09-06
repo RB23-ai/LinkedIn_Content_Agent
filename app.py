@@ -11,14 +11,18 @@ from dotenv import load_dotenv
 
 from utils.database import Database
 from utils.vector_store import VectorStore
-from utils.linkedin_publisher import LinkedInAPI, LinkedInAPIError, register_manual_competitor_post
+from utils.linkedin_publisher import (
+    LinkedInAPI, LinkedInAPIError, register_manual_competitor_post, build_organization_urn,
+)
 from utils.sharing_utils import generate_share_bundle, post_to_slack
 from utils.crew_runner import generate_post
 from utils.scheduler import start_scheduler
+from utils.theme import inject_custom_css, render_header, status_pill
 
 load_dotenv()
 
 st.set_page_config(page_title="LinkedIn AI Strategist", page_icon="🚀", layout="wide")
+inject_custom_css()
 
 # ---------------------------------------------------------------------
 # Singletons (cached so we don't reconnect to SQLite/Chroma every rerun)
@@ -34,9 +38,15 @@ def get_vector_store():
 db = get_db()
 vs = get_vector_store()
 
-if "scheduler_started" not in st.session_state:
-    start_scheduler(hour=8, minute=0)
-    st.session_state.scheduler_started = True
+@st.cache_resource
+def get_scheduler():
+    # st.cache_resource runs this ONCE per Streamlit server process and
+    # shares the result across every session/rerun -- unlike
+    # st.session_state, which is per-browser-tab and re-triggers this on
+    # every new session, which is what caused SchedulerAlreadyRunningError.
+    return start_scheduler(hour=8, minute=0)
+
+get_scheduler()
 
 # ---------------------------------------------------------------------
 # Sidebar: workspace switcher
@@ -74,17 +84,19 @@ page = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.caption("Every page only reads/writes data for the selected workspace.")
 
+render_header(selected_name)
+
 # ---------------------------------------------------------------------
 # Page: Ideas
 # ---------------------------------------------------------------------
 if page == "💡 Ideas":
-    st.header(f"Content Ideas — {selected_name}")
+    st.subheader("Content ideas")
 
     with st.form("new_idea_form"):
         title = st.text_input("Idea title")
         desc = st.text_area("Description / angle")
         score = st.slider("Estimated engagement potential", 1, 10, 5)
-        submitted = st.form_submit_button("Add idea")
+        submitted = st.form_submit_button("Add idea", type="primary")
         if submitted and title.strip():
             db.add_idea(workspace_id, title.strip(), desc.strip(), score)
             st.rerun()
@@ -92,22 +104,25 @@ if page == "💡 Ideas":
     ideas = db.get_ideas(workspace_id)
     if not ideas:
         st.info("No ideas yet -- add one above.")
+    status_kind = {"pending": "warning", "approved": "success", "rejected": "danger"}
     for idea in ideas:
-        col1, col2, col3, col4 = st.columns([4, 1, 1, 1])
-        col1.markdown(f"**{idea['title']}** ({idea['status']})  \n{idea['description']}")
-        col2.metric("Score", idea["score"])
-        if col3.button("Approve", key=f"approve_{idea['id']}"):
-            db.update_idea_status(idea["id"], workspace_id, "approved")
-            st.rerun()
-        if col4.button("Reject", key=f"reject_{idea['id']}"):
-            db.update_idea_status(idea["id"], workspace_id, "rejected")
-            st.rerun()
+        with st.container(border=True):
+            col1, col2, col3, col4 = st.columns([4, 1, 1, 1])
+            pill = status_pill(idea["status"], status_kind.get(idea["status"], "muted"))
+            col1.markdown(f"**{idea['title']}** {pill}  \n{idea['description']}", unsafe_allow_html=True)
+            col2.metric("Score", idea["score"])
+            if col3.button("Approve", key=f"approve_{idea['id']}"):
+                db.update_idea_status(idea["id"], workspace_id, "approved")
+                st.rerun()
+            if col4.button("Reject", key=f"reject_{idea['id']}"):
+                db.update_idea_status(idea["id"], workspace_id, "rejected")
+                st.rerun()
 
 # ---------------------------------------------------------------------
 # Page: Post Editor (the agent pipeline)
 # ---------------------------------------------------------------------
 elif page == "✍️ Post Editor":
-    st.header(f"Generate a Post — {selected_name}")
+    st.subheader("Generate a post")
 
     topic = st.text_input("Topic / idea to write about")
     competitors = db.get_competitors(workspace_id)
@@ -156,15 +171,23 @@ elif page == "✍️ Post Editor":
         if colC.button("✅ Publish now to LinkedIn"):
             ws = db.get_workspace(workspace_id)
             token = ws.get("linkedin_access_token") or os.getenv("LINKEDIN_ACCESS_TOKEN")
+            active_identity = ws.get("linkedin_active_identity", "person")
+            author_urn = (
+                ws.get("linkedin_org_urn") if active_identity == "organization"
+                else ws.get("linkedin_person_urn")
+            )
             if not token:
                 st.error("No LinkedIn access token configured for this workspace. Add one in Settings.")
+            elif active_identity == "organization" and not author_urn:
+                st.error("No company page connected. Connect one in Settings first.")
             else:
                 try:
                     api = LinkedInAPI(access_token=token)
                     post_id = db.add_post(workspace_id, edited_post, topic=topic, status="draft")
-                    urn = api.publish_post(edited_post)
+                    urn = api.publish_post(edited_post, author_urn=author_urn)
                     db.mark_published(post_id, workspace_id, urn)
-                    st.success(f"Published! LinkedIn post URN: {urn}")
+                    identity_label = "company page" if active_identity == "organization" else "personal profile"
+                    st.success(f"Published as {identity_label}! LinkedIn post URN: {urn}")
                 except LinkedInAPIError as e:
                     st.error(f"LinkedIn publish failed: {e}")
 
@@ -172,7 +195,7 @@ elif page == "✍️ Post Editor":
 # Page: Calendar (scheduled + draft posts)
 # ---------------------------------------------------------------------
 elif page == "📅 Calendar":
-    st.header(f"Content Calendar — {selected_name}")
+    st.subheader("Content calendar")
     tab_draft, tab_scheduled, tab_published = st.tabs(["Drafts", "Scheduled", "Published"])
 
     with tab_draft:
@@ -197,7 +220,7 @@ elif page == "📅 Calendar":
 # Page: Analytics
 # ---------------------------------------------------------------------
 elif page == "📊 Analytics":
-    st.header(f"Analytics — {selected_name}")
+    st.subheader("Analytics")
     posts = db.get_posts(workspace_id, status="published")
     if not posts:
         st.info("No published posts yet.")
@@ -211,7 +234,7 @@ elif page == "📊 Analytics":
 # Page: Competitors
 # ---------------------------------------------------------------------
 elif page == "🔍 Competitors":
-    st.header(f"Competitors — {selected_name}")
+    st.subheader("Competitors")
     st.info(
         "LinkedIn's public API doesn't allow pulling posts from profiles/pages "
         "you don't manage. Paste competitor post text below manually -- the "
@@ -240,7 +263,7 @@ elif page == "🔍 Competitors":
 # Page: Leads
 # ---------------------------------------------------------------------
 elif page == "🎯 Leads":
-    st.header(f"Leads — {selected_name}")
+    st.subheader("Leads")
     leads = db.get_leads(workspace_id)
     if not leads:
         st.info("No leads captured yet. Leads are detected from comment keywords "
@@ -256,19 +279,101 @@ elif page == "🎯 Leads":
 # Page: Settings
 # ---------------------------------------------------------------------
 elif page == "⚙️ Settings":
-    st.header(f"Settings — {selected_name}")
+    st.subheader("Settings")
     ws = db.get_workspace(workspace_id)
 
     st.subheader("LinkedIn connection")
-    current_token_set = bool(ws.get("linkedin_access_token"))
-    st.write("Token configured:" , "✅ Yes" if current_token_set else "❌ No (falls back to .env)")
-    new_token = st.text_input("LinkedIn access token (per-workspace override)", type="password")
-    if st.button("Save token"):
-        if new_token.strip():
-            try:
-                api = LinkedInAPI(access_token=new_token.strip())
-                person_urn = api.get_person_urn()
-                db.set_workspace_linkedin_credentials(workspace_id, new_token.strip(), person_urn)
-                st.success(f"Saved and verified. Person URN: {person_urn}")
-            except LinkedInAPIError as e:
-                st.error(f"Token didn't verify against LinkedIn's API: {e}")
+    st.caption(
+        "Connect the identity this workspace should publish as. You can connect "
+        "both a personal profile and a company page, then choose which one is "
+        "active when publishing."
+    )
+
+    tab_person, tab_org = st.tabs(["👤 Personal profile", "🏢 Company page"])
+
+    # ---------------- Personal profile tab ----------------
+    with tab_person:
+        person_connected = bool(ws.get("linkedin_person_urn"))
+        if person_connected:
+            st.success(f"Connected as **{ws.get('linkedin_person_name') or 'LinkedIn member'}**")
+            st.caption(f"URN: `{ws['linkedin_person_urn']}`")
+        else:
+            st.info("Not connected yet.")
+
+        with st.form("connect_person_form"):
+            new_token = st.text_input(
+                "LinkedIn access token",
+                type="password",
+                help="Generated from your LinkedIn Developer app's OAuth 2.0 Tools page, "
+                     "with scopes: openid profile email w_member_social.",
+            )
+            submitted = st.form_submit_button("Connect / verify")
+            if submitted:
+                if not new_token.strip():
+                    st.warning("Paste a token first.")
+                else:
+                    try:
+                        api = LinkedInAPI(access_token=new_token.strip())
+                        person_urn = api.get_person_urn()
+                        person_name = api.get_person_display_name()
+                        db.set_workspace_linkedin_credentials(
+                            workspace_id, new_token.strip(), person_urn, person_name
+                        )
+                        st.success(f"Connected as {person_name}.")
+                        st.rerun()
+                    except LinkedInAPIError as e:
+                        st.error(f"Couldn't verify this token against LinkedIn's API: {e}")
+
+    # ---------------- Company page tab ----------------
+    with tab_org:
+        org_connected = bool(ws.get("linkedin_org_urn"))
+        if org_connected:
+            st.success(f"Connected: **{ws.get('linkedin_org_name') or ws['linkedin_org_urn']}**")
+            st.caption(f"URN: `{ws['linkedin_org_urn']}`")
+            if st.button("Disconnect company page"):
+                db.clear_workspace_linkedin_org(workspace_id)
+                st.rerun()
+        else:
+            st.info("Not connected yet.")
+            st.caption(
+                "LinkedIn doesn't offer an API to list pages you admin on a standard "
+                "app tier, so paste the page's numeric ID instead — find it in your "
+                "page admin view URL: linkedin.com/company/**12345678**/admin"
+            )
+
+        with st.form("connect_org_form"):
+            org_id_input = st.text_input("Company page ID or URN")
+            org_display_name = st.text_input("Display name for this page (optional)")
+            submitted_org = st.form_submit_button("Connect company page")
+            if submitted_org:
+                if not org_id_input.strip():
+                    st.warning("Enter a page ID or URN first.")
+                else:
+                    try:
+                        org_urn = build_organization_urn(org_id_input)
+                        db.set_workspace_linkedin_org(
+                            workspace_id, org_urn, org_display_name.strip()
+                        )
+                        st.success("Company page saved. Note: actually publishing to it "
+                                   "also requires LinkedIn to have granted this app admin "
+                                   "access to that specific page.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+
+    # ---------------- Active identity switch ----------------
+    st.subheader("Publish as")
+    options = ["Personal profile"] if not org_connected else ["Personal profile", "Company page"]
+    if not person_connected and not org_connected:
+        st.caption("Connect an identity above before choosing what to publish as.")
+    else:
+        current = ws.get("linkedin_active_identity", "person")
+        default_index = 1 if (current == "organization" and org_connected) else 0
+        choice = st.radio("Posts from this workspace will publish as:", options,
+                           index=default_index, horizontal=True)
+        if st.button("Save publishing identity"):
+            db.set_active_linkedin_identity(
+                workspace_id, "organization" if choice == "Company page" else "person"
+            )
+            st.success(f"Will publish as: {choice}")
+            st.rerun()

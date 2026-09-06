@@ -46,6 +46,10 @@ class Database:
                     industry TEXT,
                     linkedin_access_token TEXT,
                     linkedin_person_urn TEXT,
+                    linkedin_person_name TEXT,
+                    linkedin_org_urn TEXT,
+                    linkedin_org_name TEXT,
+                    linkedin_active_identity TEXT DEFAULT 'person',  -- 'person' or 'organization'
                     created_at TEXT NOT NULL
                 );
 
@@ -101,6 +105,28 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_leads_ws ON leads(workspace_id);
                 """
             )
+        self._migrate_add_columns()
+
+    def _migrate_add_columns(self):
+        """
+        Adds new workspace columns for existing databases created before
+        the personal/company-page identity split was introduced. SQLite's
+        CREATE TABLE IF NOT EXISTS won't alter an already-existing table,
+        so new columns are added here individually, ignoring the error if
+        a column already exists.
+        """
+        new_columns = {
+            "linkedin_person_name": "TEXT",
+            "linkedin_org_urn": "TEXT",
+            "linkedin_org_name": "TEXT",
+            "linkedin_active_identity": "TEXT DEFAULT 'person'",
+        }
+        with self._conn() as conn:
+            for col, col_type in new_columns.items():
+                try:
+                    conn.execute(f"ALTER TABLE workspaces ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists -- fine
 
     # ---------------- Workspaces ----------------
     def create_workspace(self, name: str, industry: str = "") -> int:
@@ -123,11 +149,45 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    def set_workspace_linkedin_credentials(self, workspace_id: int, access_token: str, person_urn: str):
+    def set_workspace_linkedin_credentials(self, workspace_id: int, access_token: str,
+                                            person_urn: str, person_name: str = ""):
         with self._conn() as conn:
             conn.execute(
-                "UPDATE workspaces SET linkedin_access_token = ?, linkedin_person_urn = ? WHERE id = ?",
-                (access_token, person_urn, workspace_id),
+                """UPDATE workspaces
+                   SET linkedin_access_token = ?, linkedin_person_urn = ?, linkedin_person_name = ?
+                   WHERE id = ?""",
+                (access_token, person_urn, person_name, workspace_id),
+            )
+
+    def set_workspace_linkedin_org(self, workspace_id: int, org_urn: str, org_name: str = ""):
+        """Store a company-page identity the workspace can also publish as."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE workspaces SET linkedin_org_urn = ?, linkedin_org_name = ? WHERE id = ?",
+                (org_urn, org_name, workspace_id),
+            )
+
+    def clear_workspace_linkedin_org(self, workspace_id: int):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE workspaces SET linkedin_org_urn = NULL, linkedin_org_name = NULL WHERE id = ?",
+                (workspace_id,),
+            )
+            # Fall back to personal identity if the org being disconnected was active
+            conn.execute(
+                """UPDATE workspaces SET linkedin_active_identity = 'person'
+                   WHERE id = ? AND linkedin_active_identity = 'organization'""",
+                (workspace_id,),
+            )
+
+    def set_active_linkedin_identity(self, workspace_id: int, identity: str):
+        """identity: 'person' or 'organization'"""
+        if identity not in ("person", "organization"):
+            raise ValueError("identity must be 'person' or 'organization'")
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE workspaces SET linkedin_active_identity = ? WHERE id = ?",
+                (identity, workspace_id),
             )
 
     # ---------------- Ideas ----------------
